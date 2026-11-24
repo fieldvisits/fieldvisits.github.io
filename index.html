@@ -3294,6 +3294,16 @@ border-radius: 8px;
         </div>
       </div>
 
+      <div class="form-section" id="attendanceImportSection">
+        <div class="section-title">استيراد الحضور من Excel</div>
+        <div class="form-group">
+          <label>اختر ملف الحضور (xls / xlsx) بنفس أعمدة ملف الاستخراج</label>
+          <input type="file" id="attendanceImportFile" accept=".xls,.xlsx,.xml" onchange="previewAttendanceImport(this)" />
+          <small style="display:block;color:#6c757d;margin-top:6px;">الأعمدة: التاريخ، الاسم، كود الفرع، الفرع، المنطقه، الملاحظات، ... لن يتم حفظ أي شيء قبل مراجعة المعاينة وتأكيدك.</small>
+        </div>
+        <div id="attendanceImportPreview" dir="rtl"></div>
+      </div>
+
       <div class="form-section">
         <div class="section-title">استخراج إكسل الحضور</div>
         <div class="form-group">
@@ -7654,6 +7664,164 @@ async function deleteAttendanceRecord() {
 function excelSerialToDate(serial) {
   return new Date(Math.round((serial - 25569) * 86400 * 1000));
 }
+
+// ===== Attendance Excel import =====
+let attendanceImportState = null;
+
+function attImpNorm(v) { return String(v == null ? "" : v).replace(/\s+/g, " ").trim(); }
+function attImpIso(v) {
+  if (v instanceof Date && !isNaN(v)) {
+    return v.getFullYear() + "-" + String(v.getMonth() + 1).padStart(2, "0") + "-" + String(v.getDate()).padStart(2, "0");
+  }
+  const s = attImpNorm(v);
+  let m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (m) return m[1] + "-" + m[2].padStart(2, "0") + "-" + m[3].padStart(2, "0");
+  m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+  if (m) return m[3] + "-" + m[2].padStart(2, "0") + "-" + m[1].padStart(2, "0");
+  return "";
+}
+function attImpTypes() {
+  return Array.from(document.querySelectorAll("#attendanceType option")).map((o) => o.value).filter((x) => x && x !== "إجازة");
+}
+function attImpEsc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+function parseAttendanceImportRows(rows) {
+  const headerIdx = rows.findIndex((r) => r.some((c) => attImpNorm(c) === "التاريخ"));
+  if (headerIdx < 0) throw new Error("لم أجد عمود التاريخ في الملف");
+  const head = rows[headerIdx].map(attImpNorm);
+  const col = (...names) => head.findIndex((h) => names.includes(h));
+  const cDate = col("التاريخ"), cName = col("الاسم"), cCode = col("كود الفرع"), cBranch = col("الفرع"),
+        cNotes = col("الملاحظات"), cEmp = col("الكود الوظيفى", "الكود الوظيفي");
+  if (cNotes < 0) throw new Error("لم أجد عمود الملاحظات في الملف");
+  const types = attImpTypes();
+  const items = [];
+  rows.slice(headerIdx + 1).forEach((r, i) => {
+    if (!r || !r.some((c) => attImpNorm(c))) return;
+    const line = headerIdx + i + 2;
+    const date = attImpIso(r[cDate]);
+    const notes = attImpNorm(r[cNotes]);
+    const branchRaw = cBranch >= 0 ? attImpNorm(r[cBranch]) : "";
+    const code = cCode >= 0 ? attImpNorm(r[cCode]) : "";
+    const emp = cEmp >= 0 ? attImpNorm(r[cEmp]) : "";
+    const name = cName >= 0 ? attImpNorm(r[cName]) : "";
+    const item = { line, date, emp, name, error: "" };
+    if (!date) { item.error = "تاريخ غير صالح"; items.push(item); return; }
+    if (!notes) { item.error = "الملاحظات فارغة"; items.push(item); return; }
+    if (isAttendanceLeaveType(notes) && types.includes(notes)) {
+      Object.assign(item, { type: notes, places: notes, branchName: "", branchCode: "" });
+    } else {
+      let type = "", places = notes;
+      const hit = types.filter((t) => notes === t || notes.startsWith(t + " - ")).sort((a, b) => b.length - a.length)[0];
+      if (hit) { type = hit; places = notes === hit ? "" : notes.slice(hit.length + 3).trim(); }
+      else { type = "أخرى"; }
+      if (isAttendanceLeaveType(type)) places = type;
+      let branchName = branchRaw.replace(/\s*-\s*تساهيل\s*$/, "").trim();
+      if (isAttendanceLeaveType(type) || types.includes(branchName)) branchName = "";
+      const mapped = ATTENDANCE_BRANCH_CODE_MAP[branchName] || "";
+      Object.assign(item, { type, places, branchName, branchCode: mapped || code });
+      if (!places && !isAttendanceLeaveType(type)) item.error = "لا توجد أماكن/بيان لليوم";
+    }
+    items.push(item);
+  });
+  return items;
+}
+
+async function previewAttendanceImport(input) {
+  const box = document.getElementById("attendanceImportPreview");
+  attendanceImportState = null;
+  box.innerHTML = "";
+  const file = input.files && input.files[0];
+  if (!file) return;
+  try {
+    if (typeof XLSX === "undefined") throw new Error("مكتبة Excel غير محملة");
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array", cellDates: true });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: "" });
+    const items = parseAttendanceImportRows(rows);
+    if (!items.length) throw new Error("لا توجد صفوف في الملف");
+    const profile = await getUserData();
+    const myCode = attImpNorm(profile && profile.employeeCode);
+    const empSet = Array.from(new Set(items.map((x) => x.emp || x.name).filter(Boolean)));
+    const existing = await getAllAttendanceRecords();
+    const existingDates = new Map(existing.map((r) => [String(r.date), r]));
+    const valid = items.filter((x) => !x.error);
+    const seen = new Set(), fileDup = new Set();
+    valid.forEach((x) => { if (seen.has(x.date)) fileDup.add(x.date); seen.add(x.date); });
+    const dupExisting = valid.filter((x) => existingDates.has(x.date));
+    const errors = items.filter((x) => x.error);
+    let blocker = "";
+    if (empSet.length > 1) blocker = "الملف فيه أكثر من موظف (" + empSet.length + "). التطبيق حاليًا لموظف واحد، لذلك لم يتم الاستيراد. أخبر المطور لإضافة دعم عدة موظفين.";
+    else if (fileDup.size) blocker = "الملف يحتوي تاريخًا مكررًا: " + Array.from(fileDup).join("، ") + ". صحح الملف أولًا.";
+    const empWarn = (!blocker && empSet.length === 1 && myCode && items[0].emp && items[0].emp !== myCode)
+      ? "تنبيه: كود الموظف في الملف (" + attImpEsc(items[0].emp) + ") يختلف عن الكود المحفوظ في التطبيق (" + attImpEsc(myCode) + ")." : "";
+    attendanceImportState = { valid, existingDates, blocker };
+    let html = '<div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;padding:10px;margin-top:8px;">';
+    html += "<div><b>" + valid.length + "</b> يوم جاهز للاستيراد" + (errors.length ? "، و<b>" + errors.length + "</b> صف به مشكلة" : "") + (empSet.length ? " | الموظف: " + attImpEsc(empSet.join("، ")) : "") + "</div>";
+    if (blocker) html += '<div style="color:#b02a37;margin-top:6px;">' + attImpEsc(blocker) + "</div>";
+    if (empWarn) html += '<div style="color:#b26a00;margin-top:6px;">' + empWarn + "</div>";
+    if (errors.length) html += '<div style="color:#b02a37;margin-top:6px;">لن يتم استيراد: ' + errors.map((x) => "صف " + x.line + " (" + attImpEsc(x.error) + ")").join("، ") + "</div>";
+    html += '<div style="max-height:220px;overflow:auto;margin-top:8px;"><table style="width:100%;border-collapse:collapse;font-size:13px;"><tr><th>التاريخ</th><th>النوع</th><th>الأماكن / البيان</th><th>الفرع</th><th>موجود؟</th></tr>';
+    valid.forEach((x) => {
+      html += '<tr style="border-top:1px solid #dee2e6;"><td>' + attImpEsc(x.date) + "</td><td>" + attImpEsc(x.type) + "</td><td>" + attImpEsc(x.places) + "</td><td>" + attImpEsc(x.branchName) + "</td><td>" + (existingDates.has(x.date) ? "نعم" : "") + "</td></tr>";
+    });
+    html += "</table></div>";
+    if (dupExisting.length) {
+      html += '<div style="margin-top:8px;">' + dupExisting.length + ' يوم لديه تسجيل محفوظ بالفعل:<br>'
+        + '<label><input type="radio" name="attImpDup" value="skip" checked /> تخطي الأيام الموجودة (لا يتغير شيء فيها)</label><br>'
+        + '<label><input type="radio" name="attImpDup" value="replace" /> استبدال الأيام الموجودة بما في الملف</label></div>';
+    }
+    if (!blocker && valid.length) {
+      html += '<div style="margin-top:10px;"><button type="button" class="btn btn-success" onclick="confirmAttendanceImport()">استيراد ' + valid.length + ' يوم</button> '
+        + '<button type="button" class="btn btn-secondary" onclick="cancelAttendanceImport()">إلغاء</button></div>';
+    }
+    html += "</div>";
+    box.innerHTML = html;
+  } catch (e) {
+    console.error(e);
+    box.innerHTML = '<div style="color:#b02a37;margin-top:8px;">تعذر قراءة الملف: ' + attImpEsc(e.message || e) + "</div>";
+  }
+}
+
+function cancelAttendanceImport() {
+  attendanceImportState = null;
+  document.getElementById("attendanceImportPreview").innerHTML = "";
+  document.getElementById("attendanceImportFile").value = "";
+}
+
+async function confirmAttendanceImport() {
+  const st = attendanceImportState;
+  if (!st || st.blocker) return;
+  const dupMode = (document.querySelector('input[name="attImpDup"]:checked') || {}).value || "skip";
+  const toSave = [];
+  let skipped = 0;
+  st.valid.forEach((x) => {
+    const ex = st.existingDates.get(x.date);
+    if (ex && dupMode === "skip") { skipped++; return; }
+    const rec = { date: x.date, type: x.type, places: x.places, branchName: x.branchName, branchCode: x.branchCode, updatedAt: new Date().toISOString() };
+    if (ex) rec.id = ex.id;
+    toSave.push(rec);
+  });
+  if (!toSave.length) { alert("لا توجد أيام جديدة للاستيراد"); return; }
+  try {
+    if (!db || !db.objectStoreNames.contains("attendance")) { if (db) db.close(); db = null; await openDB(); }
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("attendance", "readwrite");
+      const store = tx.objectStore("attendance");
+      toSave.forEach((r) => store.put(r));
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error || new Error("فشل الحفظ"));
+      tx.onabort = () => reject(tx.error || new Error("تم إلغاء الحفظ"));
+    });
+    await refreshAttendanceSavedSelect();
+    cancelAttendanceImport();
+    alert("تم استيراد " + toSave.length + " يوم" + (skipped ? " وتخطي " + skipped + " يوم موجود" : ""));
+  } catch (e) {
+    console.error(e);
+    alert("حدث خطأ أثناء الحفظ، لم يتم تغيير أي بيانات: " + (e.message || e));
+  }
+}
+// ===== end Attendance Excel import =====
 
 async function exportAttendanceToExcel() {
   const monthValue = document.getElementById("attendanceExportMonth").value;
